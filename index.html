@@ -107,6 +107,7 @@
   .bmap circle.n:focus{outline:none}
   .bmap circle.n:focus-visible{outline:none;stroke:#A78BFA;stroke-width:3}
   .bmap line{stroke:#8B5CF6;stroke-opacity:.55;stroke-width:1.4}
+  .bmap line.dv{stroke:#FB923C;stroke-opacity:.8;stroke-dasharray:5 4}
   .bmap line.hi{stroke:#C4B5FD;stroke-opacity:1;stroke-width:2.2}
   .bmap text{font:600 11px var(--mono);fill:#0B0A14;pointer-events:none;text-anchor:middle;dominant-baseline:central}
   .bmap-info{padding:12px;border-top:1px solid var(--line);font-size:14px;min-height:48px;color:var(--muted)}
@@ -272,40 +273,82 @@ const allIx = t => [
   ...((t.meta && t.meta.innerInstructions) || []).flatMap(x => x.instructions)
 ];
 
-async function devHistory(dev){
+// Programs allowed in a "plain transfer" transaction (no swap / no DEX), so pool trades are not counted.
+const PLAIN_PROGRAMS = new Set(['system', 'spl-token', 'spl-associated-token-account', 'spl-memo']);
+const PLAIN_IDS = new Set(['ComputeBudget111111111111111111111111111111', 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr', 'Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo']);
+const isPlainTx = t => t.transaction.message.instructions.every(ix => PLAIN_PROGRAMS.has(ix.program) || PLAIN_IDS.has(ix.programId));
+
+async function devHistory(dev, mint, launchSlot){
   const sigs = await rpc('getSignaturesForAddress', [dev, {limit:1000, commitment:'confirmed'}]);
   const ok = sigs.filter(x => !x.err);
-  const sample = ok.slice(0, 100);
+  // latest 100 + up to 60 right after launch (where dev transfers usually happen)
+  const pick = new Map(ok.slice(0, 100).map(x => [x.signature, x]));
+  if (launchSlot) ok.filter(x => x.slot >= launchSlot).slice(-60).forEach(x => pick.set(x.signature, x));
+  const sample = [...pick.values()];
   const txs = await mapLimit(sample, 5, x => rpc('getTransaction', [x.signature, TX_OPTS]));
-  const created = new Map();
+  const created = new Map(), tokOut = new Map(), solOut = new Map();
   txs.forEach((t, i) => {
     if (!t) return;
     const keys = t.transaction.message.accountKeys.map(k => k.pubkey || k);
     if (keys[0] !== dev) return;                       // only txs the dev paid for
+    const time = sample[i].blockTime, sig = sample[i].signature;
     allIx(t).forEach(ix => {
       const p = ix.parsed;
       if (p && (p.type === 'initializeMint' || p.type === 'initializeMint2') && p.info && p.info.mint){
-        if (!created.has(p.info.mint)) created.set(p.info.mint, {mint:p.info.mint, time:sample[i].blockTime});
+        if (!created.has(p.info.mint)) created.set(p.info.mint, {mint:p.info.mint, time});
       }
     });
+    if (!isPlainTx(t)) return;
+    // token of this mint sent from dev to other wallets
+    const pre = (t.meta.preTokenBalances || []).filter(b => b.mint === mint);
+    const post = (t.meta.postTokenBalances || []).filter(b => b.mint === mint);
+    post.forEach(pb => {
+      if (!pb.owner || pb.owner === dev) return;
+      const pr = pre.find(x => x.accountIndex === pb.accountIndex);
+      const d = BigInt(pb.uiTokenAmount.amount) - BigInt(pr ? pr.uiTokenAmount.amount : '0');
+      if (d <= 0n) return;
+      const o = tokOut.get(pb.owner) || {to:pb.owner, amount:0n, count:0, time, sig};
+      o.amount += d; o.count++; o.time = Math.min(o.time || time, time || o.time);
+      tokOut.set(pb.owner, o);
+    });
+    // SOL sent from dev to other wallets (skip rent to token accounts / PDAs and dust)
+    allIx(t).forEach(ix => {
+      const p = ix.parsed;
+      if (ix.program !== 'system' || !p || p.type !== 'transfer' || !p.info) return;
+      const to = p.info.destination;
+      if (p.info.source !== dev || to === dev || !isOnCurve(to) || p.info.lamports < 1e7) return;
+      const o = solOut.get(to) || {to, lamports:0, count:0, time, sig};
+      o.lamports += p.info.lamports; o.count++;
+      solOut.set(to, o);
+    });
   });
-  return {list:[...created.values()], checked:sample.length, more: ok.length > sample.length};
+  const byAmt = (a, b) => (b.amount > a.amount ? 1 : b.amount < a.amount ? -1 : 0);
+  return {
+    list:[...created.values()], checked:sample.length, more: ok.length > sample.length,
+    tokenOut:[...tokOut.values()].sort(byAmt),
+    solOut:[...solOut.values()].sort((a, b) => b.lamports - a.lamports)
+  };
 }
 
 async function firstFunder(wallet){
   const page = await rpc('getSignaturesForAddress', [wallet, {limit:1000, commitment:'confirmed'}]);
-  if (page.length >= 1000) return null;                // too active to reach its first tx
+  if (page.length >= 1000) return {active:true};       // trader/bot wallet: too active to reach its first tx
   const ok = page.filter(x => !x.err);
-  if (!ok.length) return null;
-  const t = await rpc('getTransaction', [ok[ok.length - 1].signature, TX_OPTS]);
-  if (!t) return null;
-  for (const ix of allIx(t)){
-    const p = ix.parsed;
-    if (ix.program === 'system' && p && p.type === 'transfer' && p.info.destination === wallet){
-      return {funder:p.info.source, lamports:p.info.lamports};
+  if (!ok.length) return {none:true};
+  // Check the 3 oldest transactions for the first incoming SOL (transfer, createAccount, transferWithSeed).
+  for (const sig of ok.slice(-3).reverse()){
+    const t = await rpc('getTransaction', [sig.signature, TX_OPTS]);
+    if (!t) continue;
+    for (const ix of allIx(t)){
+      const p = ix.parsed;
+      if (ix.program !== 'system' || !p || !p.info) continue;
+      if ((p.type === 'transfer' || p.type === 'transferWithSeed') && p.info.destination === wallet && p.info.source !== wallet)
+        return {funder:p.info.source, lamports:p.info.lamports};
+      if ((p.type === 'createAccount' || p.type === 'createAccountWithSeed') && p.info.newAccount === wallet && p.info.source !== wallet)
+        return {funder:p.info.source, lamports:p.info.lamports};
     }
   }
-  return null;
+  return {none:true};                                    // checked, but no plain SOL funding found (e.g. funded via a swap or bridge)
 }
 
 async function traceFunding(dev, wallets){
@@ -314,7 +357,7 @@ async function traceFunding(dev, wallets){
   const map = new Map();
   targets.forEach((w, i) => {
     const r = results[i];
-    if (!r) return;
+    if (!r || r.active || r.none) return;
     const arr = map.get(r.funder) || [];
     arr.push(w);
     map.set(r.funder, arr);
@@ -330,7 +373,7 @@ async function traceFunding(dev, wallets){
     .map(([funder, ws]) => ({funder, wallets:ws, includesDev: !!dev && (ws.includes(dev) || funder === dev)}))
     .filter(c => c.wallets.length >= 2 || (dev && c.funder === dev))
     .sort((a, b) => b.wallets.length - a.wallets.length);
-  return {clusters, hubs, traced: results.filter(Boolean).length, total: targets.length};
+  return {clusters, hubs, traced: results.filter(Boolean).length, active: results.filter(r => r && r.active).length, total: targets.length};
 }
 
 async function analyze(mint){
@@ -440,7 +483,7 @@ async function analyze(mint){
 
     try {
       setStatus('Checking the dev wallet history…');
-      res.devHistory = await devHistory(dev);
+      res.devHistory = await devHistory(dev, mint, launchSlot);
     } catch(e){ res.notes.push('Dev history check failed: ' + e.message); }
   } else {
     res.notes.push('This token has too many transactions to reach the launch. Bundle and dev checks were skipped. Funding links were still checked for the top holders.');
@@ -507,6 +550,7 @@ async function analyze(mint){
   try {
     setStatus(`Tracing where ${traceList.length} wallets got their funds…`);
     res.funding = await traceFunding(dev, traceList);
+    if (res.funding.active) res.notes.push(`${res.funding.active} wallet${res.funding.active > 1 ? 's are' : ' is'} very active (1000+ transactions, likely traders or bots), so the original funder could not be checked.`);
     if (res.funding.hubs) res.notes.push(`${res.funding.hubs} shared funder${res.funding.hubs > 1 ? 's look' : ' looks'} like an exchange (1000+ transactions) and was ignored.`);
     // how much of the supply each cluster holds right now
     const nowOf = new Map(top.map(h => [h.owner, h.amount]));
@@ -551,6 +595,15 @@ function score(res){
     const others = res.devHistory.list.filter(m => m.mint !== res.mint).length;
     if (others >= 10) s += 25; else if (others >= 5) s += 20; else if (others >= 2) s += 10;
     if (others >= 2) flags.push(`The dev wallet created ${others}${res.devHistory.more ? '+' : ''} other tokens.`);
+    const tOut = res.devHistory.tokenOut || [], sOut = res.devHistory.solOut || [];
+    const sentPct = pct(tOut.reduce((x, o) => x + o.amount, 0n), sup);
+    if (tOut.length && sentPct > 1){
+      s += sentPct > 5 ? 20 : 10;
+      flags.push(`The dev sent ${fmt(sentPct)} of supply to ${tOut.length} other wallet${tOut.length > 1 ? 's' : ''} (can hide how much the dev really holds).`);
+    }
+    const known = new Set([...(res.bundleWallets || []), ...(res.snipers || [])].map(h => h.owner).concat(res.holders.map(h => h.owner)));
+    const solLinked = sOut.filter(o => known.has(o.to)).length;
+    if (solLinked){ s += 15; flags.push(`The dev sent SOL to ${solLinked} wallet${solLinked > 1 ? 's that bought or hold' : ' that bought or holds'} this token.`); }
   }
   if (res.funding){
     const nonDev = c => c.wallets.filter(w => w !== res.dev).length;
@@ -590,6 +643,24 @@ function extraSections(res){
       </ul>
       ${n ? `<div class="rows">${others.slice(0, 10).map(m => `<div class="row" style="grid-template-columns:1fr 100px"><span>${addrLink(m.mint)}</span><span class="n">${m.time ? new Date(m.time * 1000).toLocaleDateString() : ''}</span></div>`).join('')}</div>` : ''}`;
   }
+  if (res.devHistory && (res.devHistory.tokenOut || res.devHistory.solOut)){
+    const tOut = res.devHistory.tokenOut || [], sOut = res.devHistory.solOut || [];
+    const holdNow = new Map(res.holders.map(h => [h.owner, h.amount]));
+    const when = t => t ? new Date(t * 1000).toLocaleDateString() : '';
+    out += `<h2>Dev transfers</h2>
+      <ul class="facts">
+        <li><span>Wallets that got this token from the dev</span><span class="v ${tOut.length ? 'flag' : 'good'}">${tOut.length}</span></li>
+        <li><span>Wallets that got SOL from the dev</span><span class="v ${sOut.length ? 'flag' : ''}">${sOut.length}</span></li>
+      </ul>
+      ${tOut.length ? `<div class="rows" style="margin-top:10px">
+        <div class="row head"><span>Got token from dev</span><span class="n">Sent</span><span class="n">Holds now</span></div>
+        ${tOut.slice(0, 15).map(o => `<div class="row"><span>${addrLink(o.to)}</span><span class="n">${fmt(pct(o.amount, res.supply))}</span><span class="n">${holdNow.has(o.to) ? fmt(pct(holdNow.get(o.to), res.supply)) : '—'}</span></div>`).join('')}
+      </div>` : ''}
+      ${sOut.length ? `<div class="rows" style="margin-top:10px">
+        <div class="row head"><span>Got SOL from dev</span><span class="n">SOL</span><span class="n">Date</span></div>
+        ${sOut.slice(0, 15).map(o => `<div class="row"><span>${addrLink(o.to)}</span><span class="n">${(o.lamports / 1e9).toFixed(2)}</span><span class="n">${when(o.time)}</span></div>`).join('')}
+      </div>` : ''}`;
+  }
   if (res.funding){
     const f = res.funding;
     const nonDev = c => c.wallets.filter(w => w !== res.dev).length;
@@ -608,7 +679,13 @@ function render(res){
   const inc = isIncomplete(res);
   const cls = s >= 55 ? 'high' : (s >= 25 || inc) ? 'mid' : '';
   const word = s >= 55 ? 'High risk' : s >= 25 ? 'Caution' : inc ? 'Incomplete scan' : 'No major red flags';
-  if (inc && s < 55) flags.push('Scan is incomplete (launch or funding not fully traced). Not the same as safe.');
+  if (inc && s < 55){
+    const why = [];
+    if (!res.reachedEnd) why.push('the launch could not be reached (too many transactions)');
+    if (!res.funding) why.push('the funding check failed');
+    else if (res.funding.traced < res.funding.total * 0.6) why.push(`funding was traced for only ${res.funding.traced} of ${res.funding.total} wallets (likely RPC rate limit, try again in a minute)`);
+    flags.push('Scan is incomplete: ' + why.join('; ') + '. Not the same as safe.');
+  }
   const nm = res.name ? esc(res.name) + (res.symbol ? ' (' + esc(res.symbol) + ')' : '') + ' · ' : '';
 
   const sum = (arr, key) => arr.reduce((x, h) => x + h[key], 0n);
@@ -676,12 +753,13 @@ function render(res){
 
     <h2>Bubble map</h2>
     <div class="bmap"><svg id="bmsvg" viewBox="0 0 640 460" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Bubble map of holders and funding links"></svg>
-      <div class="bmap-info" id="bminfo">Tap a bubble to see the wallet. Lines connect wallets to the wallet that first funded them.</div></div>
+      <div class="bmap-info" id="bminfo">Tap a bubble to see the wallet. Purple lines: same first funder. Orange dashed lines: the dev sent tokens or SOL.</div></div>
     <ul class="bmap-key">
       <li><i style="background:var(--dev)"></i>Dev</li><li><i style="background:var(--bundle)"></i>Bundle</li>
       <li><i style="background:var(--sniper)"></i>Sniper</li><li><i style="background:var(--other)"></i>Holder</li>
       <li><i style="background:var(--pool)"></i>Pool</li><li><i style="background:var(--violet)"></i>Funder</li>
       <li><i class="ring"></i>Sold everything</li>
+      <li><i style="background:transparent;border:2px dashed var(--dev);border-radius:0;height:0;width:16px;vertical-align:3px"></i>Dev sent to</li>
     </ul>
     ${bundleSection}
 
@@ -736,6 +814,13 @@ function drawBubbleMap(res){
     add(c.funder, 'funder'); nodes.get(c.funder).held = c.held || 0n;
     c.wallets.forEach(w => { if (w !== c.funder){ add(w, 'wallet'); nodes.get(w).funder = c.funder; links.push([c.funder, w]); } });
   });
+  const dh = res.devHistory;
+  if (res.dev && dh){
+    add(res.dev, 'dev', res.devNow || 0n, res.devBought || 0n);
+    const holdNow = new Map(res.holders.map(h => [h.owner, h.amount]));
+    (dh.tokenOut || []).slice(0, 12).forEach(o => { add(o.to, 'wallet', holdNow.get(o.to) || 0n); nodes.get(o.to).fromDev = o.amount; links.push([res.dev, o.to, 'dev']); });
+    (dh.solOut || []).filter(o => nodes.has(o.to) && o.to !== res.dev).forEach(o => { nodes.get(o.to).solFromDev = o.lamports; if (!links.some(l => l[0] === res.dev && l[1] === o.to)) links.push([res.dev, o.to, 'dev']); });
+  }
   const list = [...nodes.values()];
   if (!list.length){ svg.parentNode.style.display = 'none'; return; }
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
@@ -753,7 +838,7 @@ function drawBubbleMap(res){
     n.x = W / 2 + Math.cos(a) * d; n.y = H / 2 + Math.sin(a) * d;
   });
   const byId = new Map(list.map(n => [n.id, n]));
-  const L = links.map(([a, b]) => [byId.get(a), byId.get(b)]).filter(x => x[0] && x[1]);
+  const L = links.map(([a, b, k]) => [byId.get(a), byId.get(b), k]).filter(x => x[0] && x[1]);
 
   // simple force layout, computed once (no ongoing animation)
   for (let it = 0; it < 400; it++){
@@ -782,8 +867,9 @@ function drawBubbleMap(res){
   const color = r => r === 'funder' ? 'var(--violet)' : r === 'wallet' ? 'var(--other)' : ROLE[r].c;
   const label = r => r === 'funder' ? 'Funder' : r === 'wallet' ? 'Holder' : r === 'pool' ? 'Pool / bonding curve' : r[0].toUpperCase() + r.slice(1);
   svg.innerHTML = '';
-  const lineEls = L.map(([a, b]) => {
+  const lineEls = L.map(([a, b, k]) => {
     const l = document.createElementNS(NS, 'line');
+    if (k === 'dev') l.setAttribute('class', 'dv');
     l.setAttribute('x1', a.x); l.setAttribute('y1', a.y); l.setAttribute('x2', b.x); l.setAttribute('y2', b.y);
     l._a = a.id; l._b = b.id; svg.appendChild(l); return l;
   });
@@ -799,11 +885,13 @@ function drawBubbleMap(res){
     const pick = () => {
       circles.forEach(x => x.classList.remove('sel')); c.classList.add('sel');
       lineEls.forEach(l => l.classList.toggle('hi', l._a === n.id || l._b === n.id));
-      const kids = L.filter(([a]) => a.id === n.id).length;
+      const kids = L.filter(([a, , k]) => a.id === n.id && k !== 'dev').length;
       info.innerHTML = `<b>${label(n.role)}</b> ${addrLink(n.id)}<br>` +
         (n.role === 'funder' ? `First funded <b>${kids}</b> wallet${kids === 1 ? '' : 's'} on this map` + (n.held ? `, together holding <b>${fmt(pct(n.held, sup))}</b>.` : '.')
           : `Holds <b>${fmt(n.p)}</b> now` + (n.bought > 0n ? `, bought <b>${fmt(pct(n.bought, sup))}</b> at launch` : '') +
-            (n.funder ? `, funded by ${addrLink(n.funder)}` : ''));
+            (n.funder ? `, funded by ${addrLink(n.funder)}` : '') +
+            (n.fromDev ? `, got <b>${fmt(pct(n.fromDev, sup))}</b> from the dev` : '') +
+            (n.solFromDev ? `, got <b>${(n.solFromDev / 1e9).toFixed(2)} SOL</b> from the dev` : ''));
     };
     c.addEventListener('click', pick);
     c.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' '){ e.preventDefault(); pick(); } });
@@ -840,7 +928,7 @@ function demoData(){
     dev, devBought:P(4.2), devNow:P(0.4),
     bundleWallets:bundle, snipers, holders, notes:[], flags:[],
     holderSource:'full', holderCount:1847, holderCountExact:true,
-    devHistory:{checked:100, more:true, list:[9,21,34,50,77,120].map((d, i) => ({mint:w('Old', i), time:Math.floor(Date.now() / 1000) - d * 86400}))},
+    devHistory:{checked:100, more:true, tokenOut:[{to:w('Whl', 1), amount:P(2.4), count:1, time:Math.floor(Date.now() / 1000) - 3600}], solOut:[{to:bundle[5].owner, lamports:1.5e9, count:1, time:Math.floor(Date.now() / 1000) - 7200}], list:[9,21,34,50,77,120].map((d, i) => ({mint:w('Old', i), time:Math.floor(Date.now() / 1000) - d * 86400}))},
     funding:{traced:8, total:8, clusters:[{funder:w('Fnd', 0), wallets:[dev, ...bundle.slice(0, 5).map(b => b.owner)], includesDev:true, held:P(0.4) + bundle.slice(0, 5).reduce((x, b) => x + b.now, 0n)}]}
   };
 }
@@ -865,6 +953,7 @@ $('go').addEventListener('click', async () => {
   try {
     const res = await analyze(mint);
     saveKey(key);
+    $('testout').textContent = '';
     setStatus('');
     render(res);
     addRecent(res);
