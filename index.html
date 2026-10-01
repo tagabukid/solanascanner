@@ -166,6 +166,10 @@
 
 <script>
 const SYS = '11111111111111111111111111111111';
+const MAX_SIG_PAGES = 60;     // 1000 signatures per page -> pages back through up to 60,000 transactions
+const MAX_EARLY_TX = 100;     // launch-window transactions to analyze
+const MAX_DEV_TX = 300;       // dev transactions since launch to analyze (for sells)
+const MPL = 'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s';
 const MAX_HOLDER_PAGES = 5;   // 1000 accounts per page -> up to 5,000 holders
 // Known Raydium authority accounts (pool vaults). Heuristic only.
 const KNOWN_POOL_OWNERS = new Set([
@@ -242,20 +246,41 @@ const modp = a => ((a % FP) + FP) % FP;
 function powmod(b, e){ let r = 1n; b = modp(b); while (e > 0n){ if (e & 1n) r = r * b % FP; b = b * b % FP; e >>= 1n; } return r; }
 const ED_D = modp(-121665n * powmod(121666n, FP - 2n));
 const curveCache = new Map();
+function onCurveBytes(bytes){
+  if (!bytes || bytes.length !== 32) return true;
+  let y = 0n;
+  for (let i = 31; i >= 0; i--) y = (y << 8n) | BigInt(i === 31 ? bytes[i] & 0x7f : bytes[i]);
+  if (y >= FP) return false;
+  const y2 = y * y % FP;
+  const x2 = modp(y2 - 1n) * powmod(modp(ED_D * y2 + 1n), FP - 2n) % FP;
+  if (x2 === 0n) return (bytes[31] & 0x80) === 0;
+  return powmod(x2, (FP - 1n) / 2n) === 1n;
+}
 function isOnCurve(addr){
   if (curveCache.has(addr)) return curveCache.get(addr);
-  const bytes = b58decode(addr);
-  let ok = true;
-  if (bytes && bytes.length === 32){
-    let y = 0n;
-    for (let i = 31; i >= 0; i--) y = (y << 8n) | BigInt(i === 31 ? bytes[i] & 0x7f : bytes[i]);
-    y = modp(y);
-    const y2 = y * y % FP;
-    const x2 = modp(y2 - 1n) * powmod(modp(ED_D * y2 + 1n), FP - 2n) % FP;
-    ok = x2 === 0n || powmod(x2, (FP - 1n) / 2n) === 1n;
-  }
+  const ok = onCurveBytes(b58decode(addr));
   curveCache.set(addr, ok);
   return ok;
+}
+function b58encode(bytes){
+  let n = 0n;
+  for (const b of bytes) n = n * 256n + BigInt(b);
+  let s = '';
+  while (n > 0n){ s = B58[Number(n % 58n)] + s; n /= 58n; }
+  for (const b of bytes){ if (b === 0) s = '1' + s; else break; }
+  return s;
+}
+// Same as Solana's findProgramAddress.
+async function findPda(seeds, programId){
+  const pid = Uint8Array.from(b58decode(programId)), tag = new TextEncoder().encode('ProgramDerivedAddress');
+  for (let bump = 255; bump >= 0; bump--){
+    const parts = [...seeds.map(x => Uint8Array.from(x)), Uint8Array.of(bump), pid, tag];
+    const buf = new Uint8Array(parts.reduce((x, p) => x + p.length, 0));
+    let o = 0; parts.forEach(p => { buf.set(p, o); o += p.length; });
+    const h = new Uint8Array(await crypto.subtle.digest('SHA-256', buf));
+    if (!onCurveBytes(h)) return b58encode(h);
+  }
+  return null;
 }
 
 const pct = (bn, sup) => sup === 0n ? 0 : Number(bn * 100000n / sup) / 1000;
@@ -281,27 +306,52 @@ const isPlainTx = t => t.transaction.message.instructions.every(ix => PLAIN_PROG
 async function devHistory(dev, mint, launchSlot){
   const sigs = await rpc('getSignaturesForAddress', [dev, {limit:1000, commitment:'confirmed'}]);
   const ok = sigs.filter(x => !x.err);
-  // latest 100 + up to 60 right after launch (where dev transfers usually happen)
+  const sinceLaunch = launchSlot ? ok.filter(x => x.slot >= launchSlot) : [];
+  // latest 100 + up to MAX_DEV_TX of the oldest since launch (sells and transfers usually happen early)
   const pick = new Map(ok.slice(0, 100).map(x => [x.signature, x]));
-  if (launchSlot) ok.filter(x => x.slot >= launchSlot).slice(-60).forEach(x => pick.set(x.signature, x));
+  sinceLaunch.slice(-MAX_DEV_TX).forEach(x => pick.set(x.signature, x));
   const sample = [...pick.values()];
+  const reachesLaunch = !launchSlot || sigs.length < 1000 || (ok.length && ok[ok.length - 1].slot < launchSlot);
+  const missed = sinceLaunch.filter(x => !pick.has(x.signature)).length;
+  setStatus(`Checking ${sample.length} dev wallet transactions…`);
   const txs = await mapLimit(sample, 5, x => rpc('getTransaction', [x.signature, TX_OPTS]));
+  const failed = txs.filter(t => !t).length;
   const created = new Map(), tokOut = new Map(), solOut = new Map();
+  let sold = 0n, boughtLater = 0n, received = 0n, burned = 0n;
+  const sumOwner = arr => arr.filter(b => b.owner === dev).reduce((x, b) => x + BigInt(b.uiTokenAmount.amount), 0n);
   txs.forEach((t, i) => {
-    if (!t) return;
+    if (!t || !t.meta) return;
     const keys = t.transaction.message.accountKeys.map(k => k.pubkey || k);
-    if (keys[0] !== dev) return;                       // only txs the dev paid for
-    const time = sample[i].blockTime, sig = sample[i].signature;
+    const time = sample[i].blockTime, sig = sample[i].signature, slot = sample[i].slot;
+    const pre = (t.meta.preTokenBalances || []).filter(b => b.mint === mint);
+    const post = (t.meta.postTokenBalances || []).filter(b => b.mint === mint);
+    const plain = isPlainTx(t);
+
+    // How the dev's own balance of this token changed in this transaction
+    if (launchSlot && slot >= launchSlot && (pre.length || post.length)){
+      const d = sumOwner(post) - sumOwner(pre);
+      const inWindow = slot <= launchSlot + 3;            // launch buys are already in "Dev bought at launch"
+      if (d < 0n && !plain) sold += -d;
+      else if (d > 0n && !plain && !inWindow) boughtLater += d;
+      else if (d > 0n && plain && !inWindow) received += d;
+      if (d < 0n && plain){
+        allIx(t).forEach(ix => {
+          const p = ix.parsed;
+          if (!p || !p.info || (p.type !== 'burn' && p.type !== 'burnChecked') || p.info.mint !== mint) return;
+          burned += BigInt(p.info.amount || (p.info.tokenAmount && p.info.tokenAmount.amount) || 0);
+        });
+      }
+    }
+
+    if (keys[0] !== dev) return;                       // the rest: only txs the dev paid for
     allIx(t).forEach(ix => {
       const p = ix.parsed;
       if (p && (p.type === 'initializeMint' || p.type === 'initializeMint2') && p.info && p.info.mint){
         if (!created.has(p.info.mint)) created.set(p.info.mint, {mint:p.info.mint, time});
       }
     });
-    if (!isPlainTx(t)) return;
+    if (!plain) return;
     // token of this mint sent from dev to other wallets
-    const pre = (t.meta.preTokenBalances || []).filter(b => b.mint === mint);
-    const post = (t.meta.postTokenBalances || []).filter(b => b.mint === mint);
     post.forEach(pb => {
       if (!pb.owner || pb.owner === dev) return;
       const pr = pre.find(x => x.accountIndex === pb.accountIndex);
@@ -325,9 +375,53 @@ async function devHistory(dev, mint, launchSlot){
   const byAmt = (a, b) => (b.amount > a.amount ? 1 : b.amount < a.amount ? -1 : 0);
   return {
     list:[...created.values()], checked:sample.length, more: ok.length > sample.length,
+    sold, boughtLater, received, burned,
+    sinceLaunch: sinceLaunch.length, complete: reachesLaunch && missed === 0 && failed === 0,
     tokenOut:[...tokOut.values()].sort(byAmt),
     solOut:[...solOut.values()].sort((a, b) => b.lamports - a.lamports)
   };
+}
+
+// Current balance of a wallet across all its token accounts for this mint.
+async function walletBalance(owner, mint){
+  const r = await rpc('getTokenAccountsByOwner', [owner, {mint}, {encoding:'jsonParsed', commitment:'confirmed'}]);
+  return ((r && r.value) || []).reduce((x, a) => x + BigInt(a.account.data.parsed.info.tokenAmount.amount), 0n);
+}
+
+// For tokens with too many transactions to page back: the Metaplex metadata account is only
+// touched at creation (and rare updates), so its oldest signature is the launch. Then read the
+// launch blocks directly instead of paging through the whole token history.
+async function launchViaMetadata(mint){
+  const mb = b58decode(mint);
+  if (!mb || mb.length !== 32) return null;
+  const meta = await findPda([new TextEncoder().encode('metadata'), b58decode(MPL), mb], MPL);
+  if (!meta) return null;
+  const sigs = await rpc('getSignaturesForAddress', [meta, {limit:1000, commitment:'confirmed'}]);
+  const ok = sigs.filter(s => !s.err);
+  if (!ok.length || sigs.length >= 1000) return null;
+  const first = ok[ok.length - 1];
+  const txs = [];
+  let dev = null;
+  for (let slot = first.slot; slot <= first.slot + 3; slot++){
+    setStatus(`Reading launch block ${slot - first.slot + 1} of 4…`);
+    let b = null;
+    try {
+      b = await rpc('getBlock', [slot, {encoding:'jsonParsed', transactionDetails:'accounts', maxSupportedTransactionVersion:0, rewards:false, commitment:'confirmed'}], 3);
+    } catch(e){ continue; }                           // skipped slot
+    if (!b || !b.transactions) continue;
+    b.transactions.forEach(t => {
+      if (!t.meta || t.meta.err) return;
+      if (!(t.meta.postTokenBalances || []).some(x => x.mint === mint)) return;
+      const tx = t.transaction || {};
+      const keys = (tx.accountKeys || (tx.message && tx.message.accountKeys) || []).map(k => k.pubkey || k);
+      const item = {slot, keys, meta:t.meta};
+      if (tx.signatures && tx.signatures.includes(first.signature)){ dev = keys[0]; txs.unshift(item); }
+      else txs.push(item);
+    });
+  }
+  if (!txs.length) return null;
+  txs.sort((a, b) => a.slot - b.slot);                 // stable: the create tx stays first in its slot
+  return {slot:first.slot, blockTime:first.blockTime, txs, dev};
 }
 
 async function firstFunder(wallet){
@@ -401,53 +495,66 @@ async function analyze(mint){
 
   // --- Earliest transactions
   setStatus('Finding the launch transaction…');
-  let before, all = [], reachedEnd = false;
-  for (let p = 0; p < 30; p++){
+  let before, tail = [], prev = [], sigEnd = false, read = 0;
+  for (let p = 0; p < MAX_SIG_PAGES; p++){
     const opts = {limit:1000, commitment:'confirmed'};
     if (before) opts.before = before;
     const page = await rpc('getSignaturesForAddress', [mint, opts]);
-    all.push(...page);
-    if (page.length < 1000){ reachedEnd = true; break; }
+    read += page.length;
+    if (page.length){ prev = tail; tail = page; }       // keep only the last 2 pages: the launch is at the end
+    if (page.length < 1000){ sigEnd = true; break; }
     before = page[page.length - 1].signature;
-    setStatus(`Finding the launch transaction… (${all.length.toLocaleString()} transactions read)`);
+    setStatus(`Finding the launch transaction… (${read.toLocaleString()} transactions read)`);
   }
-  res.reachedEnd = reachedEnd;
 
-  let bundleWallets = [], snipers = [], dev = null, devBought = 0n;
+  let bundleWallets = [], snipers = [], dev = null, devBought = 0n, launchSlot = null, launchTime = null;
+  let early = [];                                        // [{slot, keys, meta}] for the first 4 slots
   const holdersOf = new Map(); // owner -> {role, bought, accounts:Set}
 
-  if (reachedEnd){
-    const chrono = all.filter(s => !s.err).reverse();
-    const launchSlot = chrono[0].slot;
+  const chrono = sigEnd ? [...prev, ...tail].filter(s => !s.err).reverse() : [];
+  if (chrono.length){
+    launchSlot = chrono[0].slot; launchTime = chrono[0].blockTime;
+    let first = chrono.filter(s => s.slot <= launchSlot + 3);
+    if (first.length > MAX_EARLY_TX){ first = first.slice(0, MAX_EARLY_TX); res.notes.push(`Too many transactions in the first few slots. Only ${MAX_EARLY_TX} were analyzed.`); }
+    setStatus(`Analyzing the first ${first.length} transactions…`);
+    const txs = await mapLimit(first, 4, s => rpc('getTransaction', [s.signature, TX_OPTS]));
+    txs.forEach((t, i) => { if (t && t.meta) early.push({slot:first[i].slot, keys:t.transaction.message.accountKeys.map(k => k.pubkey || k), meta:t.meta}); });
+    res.launchVia = 'history';
+  } else if (!sigEnd){
+    setStatus('Too many transactions to page back. Looking up the launch block directly…');
+    try {
+      const L = await launchViaMetadata(mint);
+      if (L){
+        launchSlot = L.slot; launchTime = L.blockTime; early = L.txs; dev = L.dev;
+        res.launchVia = 'blocks';
+        res.notes.push(`This token has more than ${read.toLocaleString()} transactions, so the launch was found through its metadata account and read straight from the launch blocks.`);
+      }
+    } catch(e){ res.notes.push('Direct launch lookup failed: ' + e.message); }
+  }
+  res.reachedEnd = early.length > 0;
+
+  if (res.reachedEnd){
     res.launchSlot = launchSlot;
-    let early = chrono.filter(s => s.slot <= launchSlot + 3);
-    if (early.length > 70){ early = early.slice(0, 70); res.notes.push('Too many transactions in the first few slots. Only 70 were analyzed.'); }
-
-    setStatus(`Analyzing the first ${early.length} transactions…`);
-    const txs = await mapLimit(early, 4, s => rpc('getTransaction', [s.signature, {encoding:'jsonParsed', maxSupportedTransactionVersion:0, commitment:'confirmed'}]));
-
-    txs.forEach((t, idx) => {
-      if (!t) return;
-      const keys = t.transaction.message.accountKeys.map(k => k.pubkey || k);
+    res.launchTime = launchTime;
+    early.forEach(e => {
+      const keys = e.keys;
       if (!dev) dev = keys[0];
-      const pre = (t.meta.preTokenBalances || []).filter(b => b.mint === mint);
-      const post = (t.meta.postTokenBalances || []).filter(b => b.mint === mint);
+      const pre = (e.meta.preTokenBalances || []).filter(b => b.mint === mint);
+      const post = (e.meta.postTokenBalances || []).filter(b => b.mint === mint);
       post.forEach(pb => {
         const pr = pre.find(x => x.accountIndex === pb.accountIndex);
         const delta = BigInt(pb.uiTokenAmount.amount) - BigInt(pr ? pr.uiTokenAmount.amount : '0');
-        if (delta <= 0n) return;
-        const slot = early[idx].slot;
-        const h = holdersOf.get(pb.owner) || {bought:0n, firstSlot:slot, accounts:new Set()};
+        if (delta <= 0n || !pb.owner) return;
+        const h = holdersOf.get(pb.owner) || {bought:0n, firstSlot:e.slot, accounts:new Set()};
         h.bought += delta;
-        h.firstSlot = Math.min(h.firstSlot, slot);
-        h.accounts.add(keys[pb.accountIndex]);
+        h.firstSlot = Math.min(h.firstSlot, e.slot);
+        if (keys[pb.accountIndex]) h.accounts.add(keys[pb.accountIndex]);
         holdersOf.set(pb.owner, h);
       });
     });
     res.dev = dev;
     // Remove the bonding curve / pool / any program account. On pump.fun the
-    // bonding curve receives 100% of supply in the launch slot, which was being
-    // counted as a "bundle wallet" and pushed every token to High risk.
+    // bonding curve receives 100% of supply in the launch slot.
     const ownerList = [...holdersOf.keys()].filter(o => o !== dev);
     const ownerInfo = ownerList.length ? await multi(ownerList) : [];
     let removed = 0;
@@ -469,7 +576,7 @@ async function analyze(mint){
     const cur = new Map();
     accs.forEach((a, i) => {
       const v = vals[i];
-      const amt = v && v.data && v.data.parsed ? BigInt(v.data.parsed.info.tokenAmount.amount) : 0n;
+      const amt = v && v.data && v.data.parsed && v.data.parsed.info.tokenAmount ? BigInt(v.data.parsed.info.tokenAmount.amount) : 0n;
       cur.set(a, amt);
     });
     for (const [owner, h] of holdersOf){
@@ -479,14 +586,16 @@ async function analyze(mint){
     const list = [...holdersOf.values()];
     bundleWallets = list.filter(h => h.role === 'bundle').sort((a,b) => (b.bought > a.bought ? 1 : -1));
     snipers = list.filter(h => h.role === 'sniper').sort((a,b) => (b.bought > a.bought ? 1 : -1));
-    res.devNow = holdersOf.get(dev) ? holdersOf.get(dev).now : 0n;
+    // Dev's real balance across all its token accounts (not only the launch account)
+    try { res.devNow = await walletBalance(dev, mint); }
+    catch(e){ res.devNow = holdersOf.get(dev) ? holdersOf.get(dev).now : 0n; }
 
     try {
       setStatus('Checking the dev wallet history…');
       res.devHistory = await devHistory(dev, mint, launchSlot);
     } catch(e){ res.notes.push('Dev history check failed: ' + e.message); }
   } else {
-    res.notes.push('This token has too many transactions to reach the launch. Bundle and dev checks were skipped. Funding links were still checked for the top holders.');
+    res.notes.push('The launch could not be reached, so dev, bundle and sniper numbers are unknown (not zero). Funding links were still checked for the top holders.');
   }
   res.bundleWallets = bundleWallets;
   res.snipers = snipers;
@@ -617,6 +726,35 @@ function score(res){
       s += 15; flags.push('The dev wallet is linked to bundle wallets through shared funding.');
     }
   }
+  // Dev exit
+  const dh = res.devHistory;
+  if (res.reachedEnd && res.devBought > 0n){
+    const gotP = pct(res.devBought + (dh ? dh.boughtLater + dh.received : 0n), sup);
+    const soldP = dh ? pct(dh.sold, sup) : 0;
+    if (pct(res.devNow, sup) < 0.01 && gotP >= 0.5){
+      s += 15; flags.push(`The dev no longer holds any of this token (got ${fmt(gotP)}${soldP ? `, sold ${fmt(soldP)} into the pool` : ''}).`);
+    } else if (soldP >= 1){
+      s += 5; flags.push(`The dev has sold ${fmt(soldP)} of supply into the pool.`);
+    }
+  }
+  // Launch buyers exited
+  if (res.reachedEnd){
+    const lb = [...res.bundleWallets, ...res.snipers];
+    const gone = lb.filter(h => h.bought > 0n && h.now === 0n);
+    const lbP = pct(lb.reduce((x, h) => x + h.bought, 0n), sup);
+    if (lb.length >= 3 && gone.length >= Math.ceil(lb.length * 0.6) && lbP >= 3){
+      s += 5; flags.push(`${gone.length} of ${lb.length} launch buyers (bundle and sniper wallets) no longer hold this token in the wallet they bought with.`);
+    }
+  }
+  // No demand: nearly all supply still sits in the pool / bonding curve long after launch
+  const poolP = pct(res.holders.filter(h => h.role === 'pool').reduce((x, h) => x + h.amount, 0n), sup);
+  const ageH = res.launchTime ? (Date.now() / 1000 - res.launchTime) / 3600 : null;
+  if (poolP >= 95 && ageH !== null && ageH >= 1){
+    s += 20;
+    const age = ageH >= 48 ? `${Math.round(ageH / 24)} days` : `${Math.round(ageH)} hour${Math.round(ageH) === 1 ? '' : 's'}`;
+    flags.push(`${fmt(poolP)} of supply is still in the pool or bonding curve ${age} after launch. Almost nobody is holding it: likely dead or already dumped.`);
+  }
+
   const top10 = pct(res.holders.filter(h => h.role !== 'pool').slice(0, 10).reduce((x, h) => x + h.amount, 0n), sup);
   res.top10 = top10;
   if (top10 > 50){ s += 20; flags.push(`The top 10 holders (excluding the pool) hold ${fmt(top10)} of supply.`); }
@@ -639,7 +777,7 @@ function extraSections(res){
     out += `<h2>Dev history</h2>
       <ul class="facts">
         <li><span>Other tokens created by this wallet</span><span class="v ${n >= 2 ? 'flag' : 'good'}">${n}${res.devHistory.more ? '+' : ''}</span></li>
-        <li><span>Latest transactions checked</span><span class="v">${res.devHistory.checked}</span></li>
+        <li><span>Dev transactions checked</span><span class="v">${res.devHistory.checked}${res.devHistory.complete === false ? ' (partial)' : ''}</span></li>
       </ul>
       ${n ? `<div class="rows">${others.slice(0, 10).map(m => `<div class="row" style="grid-template-columns:1fr 100px"><span>${addrLink(m.mint)}</span><span class="n">${m.time ? new Date(m.time * 1000).toLocaleDateString() : ''}</span></div>`).join('')}</div>` : ''}`;
   }
@@ -673,6 +811,34 @@ function extraSections(res){
   return out;
 }
 
+// Where the dev's tokens went: bought - sold - sent - burned should equal what the dev holds now.
+function devSent(res){ return ((res.devHistory && res.devHistory.tokenOut) || []).reduce((x, o) => x + o.amount, 0n); }
+function devFlow(res){
+  const dh = res.devHistory, sup = res.supply;
+  if (!dh || dh.sold === undefined) return '';
+  const row = (label, v, sign, cls = '') => `<li><span>${label}</span><span class="v ${cls}">${sign}${fmt(pct(v, sup))}</span></li>`;
+  const sent = devSent(res);
+  let out = '';
+  if (dh.boughtLater > 0n) out += row('Dev bought later', dh.boughtLater, '+');
+  if (dh.received > 0n) out += row('Dev received from other wallets', dh.received, '+');
+  out += row('Dev sold into the pool', dh.sold, dh.sold > 0n ? '−' : '', dh.sold > 0n ? 'flag' : '');
+  out += row('Dev sent to other wallets', sent, sent > 0n ? '−' : '', sent > 0n ? 'flag' : '');
+  if (dh.burned > 0n) out += row('Dev burned', dh.burned, '−');
+  const should = res.devBought + dh.boughtLater + dh.received - dh.sold - sent - dh.burned;
+  out += `<li><span>Dev should hold now</span><span class="v">${fmt(pct(should < 0n ? 0n : should, sup))}</span></li>`;
+  return out;
+}
+function devGap(res){
+  const dh = res.devHistory, sup = res.supply;
+  if (!dh || dh.sold === undefined) return '';
+  const should = res.devBought + dh.boughtLater + dh.received - dh.sold - devSent(res) - dh.burned;
+  const gap = should - (res.devNow || 0n);
+  const g = pct(gap < 0n ? -gap : gap, sup);
+  if (g < 0.05) return `<li><span>Dev numbers add up</span><span class="v good">yes</span></li>`;
+  const why = dh.complete ? 'moved in a way this scan does not track' : 'not all dev transactions were checked';
+  return `<li><span>Not explained (${why})</span><span class="v flag">${gap > 0n ? '−' : '+'}${fmt(g)}</span></li>`;
+}
+
 function render(res){
   const {s, flags} = score(res);
   const sup = res.supply;
@@ -689,12 +855,12 @@ function render(res){
   const nm = res.name ? esc(res.name) + (res.symbol ? ' (' + esc(res.symbol) + ')' : '') + ' · ' : '';
 
   const sum = (arr, key) => arr.reduce((x, h) => x + h[key], 0n);
-  const devNow = res.reachedEnd ? pct(res.devNow, sup) : 0;
-  const bNow = res.reachedEnd ? pct(sum(res.bundleWallets, 'now'), sup) : 0;
-  const sNow = res.reachedEnd ? pct(sum(res.snipers, 'now'), sup) : 0;
+  const devNow = res.reachedEnd ? pct(res.devNow, sup) : null;
+  const bNow = res.reachedEnd ? pct(sum(res.bundleWallets, 'now'), sup) : null;
+  const sNow = res.reachedEnd ? pct(sum(res.snipers, 'now'), sup) : null;
   const poolPct = pct(res.holders.filter(h => h.role === 'pool').reduce((x, h) => x + h.amount, 0n), sup);
   const otherTop = Math.max(0, pct(res.holders.slice(0, 20).filter(h => h.role === 'wallet').reduce((x, h) => x + h.amount, 0n), sup));
-  const used = devNow + bNow + sNow + poolPct + otherTop;
+  const used = (devNow || 0) + (bNow || 0) + (sNow || 0) + poolPct + otherTop;
   const rest = Math.max(0, 100 - used);
   const seg = [
     ['Pool / bonding curve', poolPct, 'var(--pool)'],
@@ -717,7 +883,9 @@ function render(res){
       <ul class="facts">
         <li><span>Deployer (dev)</span><span class="v">${addrLink(res.dev)}</span></li>
         <li><span>Dev bought at launch</span><span class="v">${fmt(pct(res.devBought, sup))}</span></li>
+        ${devFlow(res)}
         <li><span>Dev still holds</span><span class="v ${devNow > 5 ? 'flag' : ''}">${fmt(devNow)}</span></li>
+        ${devGap(res)}
         <li><span>Bought in the launch slot</span><span class="v ${(res.bundleWallets.length >= 3 || bB >= 20) ? 'flag' : 'good'}">${res.bundleWallets.length} wallets · ${fmt(bB)}</span></li>
         <li><span>Bought 1–3 slots later</span><span class="v">${res.snipers.length} wallets</span></li>
       </ul>
@@ -738,17 +906,17 @@ function render(res){
     <div class="verdict ${cls}">
       <div class="tok">${nm}${esc(res.mint)}</div>
       <div class="word">${word}</div>
-      <div class="score">Risk score: ${s} / 100</div>
+      <div class="score">${!res.reachedEnd && s < 55 ? `Risk score: unknown (partial checks: ${s} / 100)` : `Risk score: ${s} / 100`}</div>
     </div>
 
     ${flags.length ? `<ul class="facts">${flags.map(f => `<li class="flag"><span>${esc(f)}</span></li>`).join('')}</ul>` : ''}
 
     <h2>Who holds the supply now</h2>
     <div class="bar" role="img" aria-label="Supply breakdown">
-      ${seg.map(x => `<span style="width:${x[1]}%;background:${x[2]}"></span>`).join('')}
+      ${seg.map(x => `<span style="width:${x[1] || 0}%;background:${x[2]}"></span>`).join('')}
     </div>
     <ul class="legend">
-      ${seg.map(x => `<li><i style="background:${x[2]}"></i>${x[0]}<b>${fmt(x[1])}</b></li>`).join('')}
+      ${seg.map(x => `<li><i style="background:${x[2]}"></i>${x[0]}<b>${x[1] === null ? 'unknown' : fmt(x[1])}</b></li>`).join('')}
     </ul>
 
     <h2>Bubble map</h2>
@@ -783,7 +951,7 @@ function render(res){
     <h2>Notes</h2>
     <div class="notes">
       ${res.notes.map(n => `<p>${esc(n)}</p>`).join('')}
-      <p>This is an estimate, not a guarantee. If a bundler moves tokens to another wallet, they no longer show as held. Dev history only covers the dev wallet's latest 100 transactions, and many devs use a fresh wallet for each launch. A shared funding wallet can also be an exchange, so check the address before drawing conclusions. Wallets that are too active to reach their first transaction are skipped.</p>
+      <p>This is an estimate, not a guarantee. If a bundler moves tokens to another wallet, they no longer show as held. Dev history covers the dev wallet's latest 100 transactions plus up to 300 since launch, and many devs use a fresh wallet for each launch. A shared funding wallet can also be an exchange, so check the address before drawing conclusions. Wallets that are too active to reach their first transaction are skipped.</p>
       <p>The "pool" label is a guess based on whether a program owns the account.</p>
       <p>This is not financial advice. Do your own research before buying.</p>
     </div>`;
@@ -928,7 +1096,8 @@ function demoData(){
     dev, devBought:P(4.2), devNow:P(0.4),
     bundleWallets:bundle, snipers, holders, notes:[], flags:[],
     holderSource:'full', holderCount:1847, holderCountExact:true,
-    devHistory:{checked:100, more:true, tokenOut:[{to:w('Whl', 1), amount:P(2.4), count:1, time:Math.floor(Date.now() / 1000) - 3600}], solOut:[{to:bundle[5].owner, lamports:1.5e9, count:1, time:Math.floor(Date.now() / 1000) - 7200}], list:[9,21,34,50,77,120].map((d, i) => ({mint:w('Old', i), time:Math.floor(Date.now() / 1000) - d * 86400}))},
+    launchTime:Math.floor(Date.now() / 1000) - 3 * 3600,
+    devHistory:{checked:100, more:true, sold:P(1.4), boughtLater:0n, received:0n, burned:0n, complete:true, sinceLaunch:40, tokenOut:[{to:w('Whl', 1), amount:P(2.4), count:1, time:Math.floor(Date.now() / 1000) - 3600}], solOut:[{to:bundle[5].owner, lamports:1.5e9, count:1, time:Math.floor(Date.now() / 1000) - 7200}], list:[9,21,34,50,77,120].map((d, i) => ({mint:w('Old', i), time:Math.floor(Date.now() / 1000) - d * 86400}))},
     funding:{traced:8, total:8, clusters:[{funder:w('Fnd', 0), wallets:[dev, ...bundle.slice(0, 5).map(b => b.owner)], includesDev:true, held:P(0.4) + bundle.slice(0, 5).reduce((x, b) => x + b.now, 0n)}]}
   };
 }
